@@ -19,29 +19,25 @@
 // (HandTrack) -> published on a topic, and pushed to HandtrackGui for display.
 //
 // Everything visual lives in HandtrackGui; this file is capture, inference and
-// ROS plumbing. The GUI takes hands keyed by source, so the same callback that
-// carries our own landmarks will carry a peer's once the mesh exists here.
+// ROS plumbing. Our own hands go to the GUI through a callback; a peer's arrive
+// on the topic and go to the GUI as visitors.
 //
 // Three threads, and GTK owns the one main() runs on:
 //   - camera thread: RpiCam invokes our frame callback per viewfinder frame. It
 //     hands the newest frame to the worker and passes the frame to the GUI,
 //     never blocking on the pipeline.
 //   - worker thread: runs inference, publishes, and pushes hands to the GUI.
-//   - executor thread: rclcpp::spin, so the node answers `ros2 node`/`ros2 param`
+//   - executor thread: rclcpp::spin, so the node answers `ros2 node`/`ros2
+//   param`
 //     while GTK's main loop has the original thread.
 // Video stays at camera rate; the skeleton lags by roughly one inference.
-#include "handtracking.hpp"
-#include "rpi_cam.hpp"
-#include "handtrack_gui.hpp"
+#include <pthread.h>
+#include <sched.h>
 
-#include <ament_index_cpp/get_package_share_directory.hpp>
-#include <handtrack/msg/hand_set.hpp>
-#include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/color_rgba.hpp>
-
-#include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -50,310 +46,338 @@
 #include <cstring>
 #include <ctime>
 #include <format>
+#include <handtrack/msg/hand_set.hpp>
 #include <mutex>
+#include <opencv2/imgproc.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <set>
+#include <std_msgs/msg/color_rgba.hpp>
 #include <string>
-#include <pthread.h>
-#include <sched.h>
 #include <thread>
 #include <vector>
 
-constexpr int DISPLAY_PRIO = 12;
-constexpr int INFER_PRIO   = 8;
-constexpr int DEFAULT_CAM_UNIT = 1;
+#include "handtrack_gui.hpp"
+#include "handtracking.hpp"
+#include "rpi_cam.hpp"
+
+constexpr int DEFAULT_CAM_UNIT = 5;  // USB camera for RPI5
 constexpr const char* TOPIC = "/handtrack/hands";
 
-static void set_prio(int prio) {
-    struct sched_param sp;
-    int policy = 0;
-    if (pthread_getschedparam(pthread_self(), &policy, &sp) != 0) return;
-    sp.sched_priority = prio;
-    if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0)
-        fprintf(stderr, "warn: could not set thread priority %d\n", prio);
-}
-
-// Cleared once the window closes or rclcpp is shut down (Ctrl-C). rclcpp installs
-// its own SIGINT handler, so there is no signal() call here -- the GTK timer at
-// the bottom of main() watches rclcpp::ok() and closes the window.
+// Cleared once the window closes or rclcpp is shut down (Ctrl-C). rclcpp
+// installs its own SIGINT handler, so there is no signal() call here -- the GTK
+// timer at the bottom of main() watches rclcpp::ok() and closes the window.
 static std::atomic<bool> g_run{true};
 
 // Frame handoff: one slot, newest wins. Frames the worker misses are dropped.
-static std::mutex              g_in_mtx;
+static std::mutex g_in_mtx;
 static std::condition_variable g_in_cv;
-static cv::Mat                 g_in_frame;
-static bool                    g_in_ready = false;
+static cv::Mat g_in_frame;
+static bool g_in_ready = false;
 
 // Inference results go straight to the GUI and the topic, so nothing is kept
 // here but the numbers the status line needs.
-static std::atomic<long>  g_infers{0};
-static std::atomic<long>  g_infer_us{0};
-static std::atomic<int>   g_hand_count{0};
+static std::atomic<long> g_infers{0};
+// Cumulative, not the last reading: the status line reports the mean over the
+// same window it measures the rates over, so the two agree.
+static std::atomic<long> g_infer_us_total{0};
+static std::atomic<int> g_hand_count{0};
 static std::atomic<float> g_best_score{0.f};
 
-static double elapsed(const struct timespec& a, const struct timespec& b) {
-    return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+static int32_t g_source_id = 0;
+
+using Clock = std::chrono::steady_clock;
+
+static double secs(Clock::time_point a, Clock::time_point b) {
+  return std::chrono::duration<double>(b - a).count();
 }
 
-// ColorRGBA -> the GUI's BGR scalar. Alpha 0 means the sender had no preference,
-// which HandSource signals with a negative component.
+// ColorRGBA -> the GUI's BGR scalar. Alpha 0 means the sender had no
+// preference, which HandVisitor signals with a negative component.
 static cv::Scalar to_bgr(const std_msgs::msg::ColorRGBA& c) {
-    if (c.a <= 0.f) return {-1, -1, -1};
-    return {c.b * 255.0, c.g * 255.0, c.r * 255.0};
+  if (c.a <= 0.f) return {-1, -1, -1};
+  return {c.b * 255.0, c.g * 255.0, c.r * 255.0};
+}
+
+// The reverse, for publishing MY_COLOUR.
+static std_msgs::msg::ColorRGBA to_rgba(const cv::Scalar& bgr) {
+  std_msgs::msg::ColorRGBA c;
+  c.b = static_cast<float>(bgr[0] / 255.0);
+  c.g = static_cast<float>(bgr[1] / 255.0);
+  c.r = static_cast<float>(bgr[2] / 255.0);
+  c.a = 1.f;
+  return c;
 }
 
 // One message per inference, so an empty hands[] is a positive "no hands this
 // frame" rather than silence.
 //
-// Landmarks and the bounding box are normalized against the frame they were
-// found in, so a peer with a different camera resolution can scale them to its
-// own window without knowing anything about ours.
-static handtrack::msg::HandSet to_msg(const std::vector<Hand>& hands, cv::Size frame,
-                                      const rclcpp::Time& stamp, const std::string& source_id,
-                                      const std::string& label,
-                                      const std_msgs::msg::ColorRGBA& color) {
-    handtrack::msg::HandSet msg;
-    msg.header.stamp = stamp;
-    msg.source_id = source_id;
-    msg.label = label;
-    msg.color = color;
-    msg.hands.reserve(hands.size());
+// A peer draws a dot, not a skeleton, so only the centre of each hand goes on
+// the wire -- normalized against the frame it was found in, so a peer with a
+// different camera resolution can scale it to its own window without knowing
+// anything about ours.
+static handtrack::msg::HandSet to_msg(const std::vector<Hand>& hands,
+                                      cv::Size frame,
+                                      const rclcpp::Time& stamp) {
+  handtrack::msg::HandSet msg;
+  msg.header.stamp = stamp;
+  msg.source_id = g_source_id;
+  msg.label = MY_LABEL;
+  msg.colour = to_rgba(MY_COLOUR);
+  msg.hands.reserve(hands.size());
 
-    const double fw = frame.width, fh = frame.height;
-    for (const auto& h : hands) {
-        handtrack::msg::Hand out;
-        for (size_t j = 0; j < h.pts.size(); ++j) {
-            out.landmarks[j].x = h.pts[j].x / fw;
-            out.landmarks[j].y = h.pts[j].y / fh;
-        }
-        const cv::Rect box = hand_bbox(h, frame);
-        out.bbox = {static_cast<float>(box.x / fw), static_cast<float>(box.y / fh),
-                    static_cast<float>(box.width / fw), static_cast<float>(box.height / fh)};
-        out.score = h.score;
-        out.handedness = h.handed;
-        msg.hands.push_back(out);
-    }
-    return msg;
+  const double fw = frame.width, fh = frame.height;
+  for (const auto& h : hands) {
+    handtrack::msg::Hand out;
+    const cv::Rect box = hand_bbox(h, frame);
+    out.point.x = (box.x + box.width / 2.0) / fw;
+    out.point.y = (box.y + box.height / 2.0) / fh;
+    out.score = h.score;
+    out.handedness = h.handed;
+    msg.hands.push_back(out);
+  }
+  return msg;
 }
 
-// The reverse, for a peer's hands: normalized back up into our own window, since
-// that is the space the GUI draws in.
-static std::vector<Hand> from_msg(const handtrack::msg::HandSet& msg, cv::Size frame) {
-    std::vector<Hand> hands;
-    hands.reserve(msg.hands.size());
-    for (const auto& in : msg.hands) {
-        Hand h;
-        for (size_t j = 0; j < h.pts.size(); ++j)
-            h.pts[j] = cv::Point2f(static_cast<float>(in.landmarks[j].x * frame.width),
-                                   static_cast<float>(in.landmarks[j].y * frame.height));
-        h.score = in.score;
-        h.handed = in.handedness;
-        hands.push_back(h);
+static void infer_worker(
+    HandTrack* pipe, rclcpp::Node* node,
+    rclcpp::Publisher<handtrack::msg::HandSet>::SharedPtr pub,
+    HandtrackGui::HandsCallback on_hands) {
+  for (;;) {
+    cv::Mat frame;
+    {
+      std::unique_lock<std::mutex> lk(g_in_mtx);
+      g_in_cv.wait(lk, [] { return g_in_ready || !g_run.load(); });
+      if (!g_run.load()) return;
+      frame = std::move(g_in_frame);
+      g_in_ready = false;
     }
-    return hands;
-}
 
-static void infer_worker(HandTrack* pipe, rclcpp::Node* node,
-                         rclcpp::Publisher<handtrack::msg::HandSet>::SharedPtr pub,
-                         HandtrackGui::HandsCallback on_hands, HandSource self,
-                         std_msgs::msg::ColorRGBA color) {
-    set_prio(INFER_PRIO);
-    for (;;) {
-        cv::Mat frame;
-        {
-            std::unique_lock<std::mutex> lk(g_in_mtx);
-            g_in_cv.wait(lk, [] { return g_in_ready || !g_run.load(); });
-            if (!g_run.load()) return;
-            frame = std::move(g_in_frame);
-            g_in_ready = false;
-        }
+    const auto started = Clock::now();
+    auto hands = pipe->detect(frame, 2);
+    const auto finished = Clock::now();
 
-        struct timespec a, b;
-        clock_gettime(CLOCK_MONOTONIC, &a);
-        auto hands = pipe->detect(frame, 2);
-        clock_gettime(CLOCK_MONOTONIC, &b);
+    // Out to the mesh, where peers draw us as a visitor, and to our own
+    // overlay, which draws the full skeleton.
+    pub->publish(to_msg(hands, frame.size(), node->now()));
 
-        pub->publish(to_msg(hands, frame.size(), node->now(), self.id, self.label, color));
+    float best = 0.f;
+    for (const auto& h : hands) best = std::max(best, h.score);
+    g_hand_count.store(static_cast<int>(hands.size()));
+    g_best_score.store(best);
+    on_hands(hands);
 
-        // Our own hands are just another source as far as the GUI is concerned;
-        // a peer's arrive through the same callback with a different id.
-        float best = 0.f;
-        for (const auto& h : hands) best = std::max(best, h.score);
-        g_hand_count.store(static_cast<int>(hands.size()));
-        g_best_score.store(best);
-        on_hands(self, hands);
-
-        g_infer_us.store(static_cast<long>(elapsed(a, b) * 1e6));
-        ++g_infers;
-    }
+    g_infer_us_total += std::chrono::duration_cast<std::chrono::microseconds>(
+                            finished - started)
+                            .count();
+    ++g_infers;
+  }
 }
 
 int main(int argc, char** argv) {
-    rclcpp::init(argc, argv);
-    set_prio(DISPLAY_PRIO);
+  rclcpp::init(argc, argv);
 
-    auto node = std::make_shared<rclcpp::Node>("handtrack_node");
-    // CAM_UNIT still works as the default so the existing invocation keeps
-    // running; --ros-args -p camera_unit:=N wins over it.
-    const char* env = getenv("CAM_UNIT");
-    const int unit = node->declare_parameter<int>(
-        "camera_unit", env && *env ? atoi(env) : DEFAULT_CAM_UNIT);
+  auto node = std::make_shared<rclcpp::Node>("handtrack_node");
 
-    // Identity carried on every message, so a display can say whose hands it is
-    // drawing. Defaults to the node's fully-qualified name, which is already
-    // unique on a graph; override when running several nodes per machine.
-    HandSource self;
-    self.id = "Larry TODO change"
-    self.local = true;
-    self.label = "Workshop"
-    self.color = to_bgr(color);
+  const int unit =
+      node->declare_parameter<int>("camera_unit", DEFAULT_CAM_UNIT);
 
-    auto pub = node->create_publisher<handtrack::msg::HandSet>(TOPIC, rclcpp::QoS(1));
+  auto pub =
+      node->create_publisher<handtrack::msg::HandSet>(TOPIC, rclcpp::QoS(1));
 
-    // Camera first: the window is opened at the camera's native size, so the
-    // frame is never scaled up only for inference to scale it back down.
-    RpiCam cam(static_cast<camera_unit_t>(unit));
-    int err = cam.init();
-    if (err != EOK) {
-        RCLCPP_ERROR(node->get_logger(), "camera init failed: %s", strerror(err));
-        return 1;
-    }
-    auto [cw, ch] = cam.get_frame_size();
+  // Generate random source id
+  // In theory it is possible for collision but the likelyhood is so little
+  // lets pretend that it could never happen.
+  srand(time(NULL));
+  g_source_id = rand();
 
-    HandtrackGui gui;
-    if (gui.open(cw, ch) != 0) {
-        RCLCPP_ERROR(node->get_logger(), "gtk display open failed");
-        return 1;
-    }
-    const int DW = gui.width(), DH = gui.height();
+  // Camera first: the window is opened at the camera's native size, so the
+  // frame is never scaled up only for inference to scale it back down.
+  RpiCam cam(static_cast<camera_unit_t>(unit));
+  int err = cam.init();
+  if (err != EOK) {
+    RCLCPP_ERROR(node->get_logger(), "camera init failed: %s", strerror(err));
+    return 1;
+  }
+  auto [cw, ch] = cam.get_frame_size();
 
-    RCLCPP_INFO(node->get_logger(), "camera unit %d  %dx%d  window %dx%d", unit, cw, ch, DW, DH);
-    if ((cw | ch) & 1) {
-        RCLCPP_ERROR(node->get_logger(), "need even camera dimensions for NV12");
-        return 1;
-    }
+  HandtrackGui gui;
+  if (gui.open(cw, ch) != 0) {
+    RCLCPP_ERROR(node->get_logger(), "gtk display open failed");
+    return 1;
+  }
+  const int DW = gui.width(), DH = gui.height();
 
-    // Find the ML model from our ros2 directory
-    std::string model_dir;
-    try {
-        model_dir = ament_index_cpp::get_package_share_directory("handtrack") + "/";
-    } catch (const std::exception& e) {
-        RCLCPP_WARN(node->get_logger(), "package share dir not found (%s), using ./models", e.what());
-    }
-    HandTrack pipe(model_dir + det_model_path(), model_dir + lm_model_path());
-    RCLCPP_INFO(node->get_logger(), "hand pipeline ready; source '%s' on %s",
-                self.id.c_str(), pub->get_topic_name());
+  RCLCPP_INFO(node->get_logger(), "camera unit %d  %dx%d  window %dx%d", unit,
+              cw, ch, DW, DH);
+  if ((cw | ch) & 1) {
+    RCLCPP_ERROR(node->get_logger(), "need even camera dimensions for NV12");
+    return 1;
+  }
 
-    // The other half of the mesh. Created here rather than beside the publisher
-    // because scaling a peer's normalized landmarks needs the window size, which
-    // only exists once the GUI is open.
-    const auto on_hands = gui.hands_callback();
-    const cv::Size window(DW, DH);
-    auto seen = std::make_shared<std::set<std::string>>();
-    auto logger = node->get_logger();
-    auto sub = node->create_subscription<handtrack::msg::HandSet>(
-        TOPIC, rclcpp::QoS(10),
-        [on_hands, window, self, seen, logger](const handtrack::msg::HandSet::SharedPtr msg) {
-            // We got our own message ignore.
-            if (msg->source_id == self.id) return;
-            HandSource src;
-            src.local = false;
-            src.id = msg->source_id;
-            src.label = msg->label.empty() ? msg->source_id : msg->label;
-            src.color = to_bgr(msg->color);
-            
-            // Insert them into our seen list
-            if (seen->insert(src.id).second) {
-                RCLCPP_INFO(logger, "peer '%s' joined", src.label.c_str());
-            }
-            on_hands(src, from_msg(*msg, window));
-        });
+  // Find the ML model from our ros2 directory
+  std::string model_dir;
+  try {
+    model_dir = ament_index_cpp::get_package_share_directory("handtrack") + "/";
+  } catch (const std::exception& e) {
+    RCLCPP_WARN(node->get_logger(),
+                "package share dir not found (%s), using ./models", e.what());
+  }
+  // The model paths come from HandTrackConfig's defaults and are relative to
+  // the share directory, so they need resolving before the pipeline loads them.
+  HandTrackConfig cfg;
 
-    std::thread worker(infer_worker, &pipe, node.get(), pub, on_hands, self, color);
-    // GTK takes this thread at gui.run(), so the executor needs its own.
-    std::thread executor([node] { rclcpp::spin(node); });
+  // Params for model
+  cfg.det_th = node->declare_parameter<double>("det_th", cfg.det_th);
+  cfg.presence_th =
+      node->declare_parameter<double>("presence_th", cfg.presence_th);
+  cfg.track_scale =
+      node->declare_parameter<double>("track_scale", cfg.track_scale);
+  cfg.tracking = node->declare_parameter<bool>("tracking", cfg.tracking);
+  cfg.redetect_every =
+      node->declare_parameter<int>("redetect_every", cfg.redetect_every);
+  cfg.mirror = node->declare_parameter<bool>("mirror", cfg.mirror);
+  cfg.threads = node->declare_parameter<int>("threads", cfg.threads);
+  cfg.det_model = model_dir + cfg.det_model;
+  cfg.lm_model = model_dir + cfg.lm_model;
 
-    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
-    long frames = 0;
-    cv::Mat disp;
+  HandTrack pipe(cfg);
+  RCLCPP_INFO(node->get_logger(), "hand pipeline ready; source %d (%s) on %s",
+              g_source_id, MY_LABEL, pub->get_topic_name());
 
-    // Runs on the camera library's thread for every viewfinder frame. RpiCam has
-    // already converted NV12 to BGR at camera resolution, and the window is opened
-    // at that same size, so this is normally a copy rather than a rescale.
-    auto on_frame = [&](const cv::Mat& bgr) {
-        static thread_local bool prio_set = (set_prio(DISPLAY_PRIO), true);
-        (void)prio_set;
-        if (!g_run.load()) return;
+  // The other half of the mesh. Created here rather than beside the publisher
+  // because scaling a peer's normalized points needs the window size, which
+  // only exists once the GUI is open.
+  const auto on_hands = gui.hands_callback();
+  const cv::Size window(DW, DH);
+  auto sub = node->create_subscription<handtrack::msg::HandSet>(
+      TOPIC, rclcpp::QoS(10),
+      [&gui, window](const handtrack::msg::HandSet::SharedPtr msg) {
+        // Our own message came back to us; we already draw those as hands.
+        if (msg->source_id == g_source_id) return;
 
-        // Resized here rather than in the GUI because inference runs on this same
-        // frame, and the landmarks it returns have to be in window coordinates
-        // for every source's overlay to line up.
-        if (bgr.cols == DW && bgr.rows == DH) bgr.copyTo(disp);
-        else cv::resize(bgr, disp, {DW, DH});
-
-        // Hand off a private copy; disp is reused on the next frame.
-        cv::Mat next = disp.clone();
-        {
-            std::lock_guard<std::mutex> lk(g_in_mtx);
-            g_in_frame = std::move(next);
-            g_in_ready = true;
+        HandVisitor visitor;
+        visitor.id = msg->source_id;
+        visitor.label = msg->label;
+        visitor.colour = to_bgr(msg->colour);
+        visitor.pts.reserve(msg->hands.size());
+        for (const auto& in : msg->hands) {
+          HandVisitor::Info info;
+          info.pt = cv::Point2f(static_cast<float>(in.point.x * window.width),
+                                static_cast<float>(in.point.y * window.height));
+          info.score = in.score;
+          info.handedness = in.handedness;
+          visitor.pts.push_back(info);
         }
-        g_in_cv.notify_one();
+        gui.update_visitor(visitor);
+      });
 
-        ++frames;
-        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-        double sec = elapsed(t0, now);
-        // Show the best score alongside the count: a detection sitting just over
-        // the threshold looks the same as a solid one in a bare hand count.
-        std::string label = std::format("{:.1f} fps  ai {:.1f} fps ({} ms)  hands {} ({:.2f})",
-                                        frames / sec, g_infers.load() / sec,
-                                        g_infer_us.load() / 1000, g_hand_count.load(),
-                                        g_best_score.load());
-        // The label is drawn by GTK in widget coordinates, not baked into the
-        // frame: at 320x240 capture a fixed-size cv::putText ran off the edge.
-        gui.set_status(label);
+  std::thread worker(infer_worker, &pipe, node.get(), pub, on_hands);
 
-        // The GUI draws every source's hands over this frame, ours included.
-        gui.show_frame(disp);
+  // GTK takes this thread at gui.run(), so the executor needs its own.
+  std::thread executor([node] { rclcpp::spin(node); });
 
-        // Throttled: the status line is already on the window, and a node's
-        // stdout usually ends up in a launch log nobody is watching live.
-        if (frames % 150 == 0)
-            RCLCPP_INFO(node->get_logger(), "%s", label.c_str());
-    };
+  // Rates are measured over a rolling window, so every figure in the status
+  // line describes the same recent stretch of time.
+  constexpr double REPORT_SEC = 0.5;
+  auto win_start = Clock::now();
+  long frames = 0, win_frames = 0, win_infers = 0, win_us = 0, reports = 0;
+  cv::Mat disp;
 
-    err = cam.start(on_frame);
-    if (err != EOK) {
-        RCLCPP_ERROR(node->get_logger(), "camera start failed: %s", strerror(err));
-        g_run = false;
-        g_in_cv.notify_all();
-        worker.join();
-        rclcpp::shutdown();
-        executor.join();
-        return 1;
+  // Runs on the camera library's thread for every viewfinder frame. RpiCam has
+  // already converted NV12 to BGR at camera resolution, and the window is
+  // opened at that same size, so this is normally a copy rather than a rescale.
+  auto on_frame = [&](const cv::Mat& bgr) {
+    if (!g_run.load()) return;
+
+    // Resized here rather than in the GUI because inference runs on this same
+    // frame, and the landmarks it returns have to be in window coordinates
+    // for every source's overlay to line up.
+    if (bgr.cols == DW && bgr.rows == DH)
+      bgr.copyTo(disp);
+    else
+      cv::resize(bgr, disp, {DW, DH});
+
+    // Hand off a private copy; disp is reused on the next frame.
+    cv::Mat next = disp.clone();
+    {
+      std::lock_guard<std::mutex> lk(g_in_mtx);
+      g_in_frame = std::move(next);
+      g_in_ready = true;
+    }
+    g_in_cv.notify_one();
+
+    ++frames;
+    const auto now = Clock::now();
+    const double dt = secs(win_start, now);
+    if (dt >= REPORT_SEC) {
+      const long infers = g_infers.load(), us = g_infer_us_total.load();
+      const long ran = infers - win_infers;
+      // Mean over the window, matching the rates beside it. ai fps is capped
+      // by the camera -- one inference per delivered frame -- so it tracks fps
+      // until inference is the slower of the two.
+      const double ms = ran ? (us - win_us) / 1000.0 / ran : 0.0;
+      // Show the best score alongside the count: a detection sitting just over
+      // the threshold looks the same as a solid one in a bare hand count.
+      const std::string label = std::format(
+          "Camera {:.1f} fps  AI Inference {:.1f} fps ({:.0f} ms)  hands {} "
+          "({:.2f})",
+          (frames - win_frames) / dt, ran / dt, ms, g_hand_count.load(),
+          g_best_score.load());
+      // Drawn by GTK in widget coordinates, so the line is unaffected by the
+      // capture resolution.
+      gui.set_status(label);
+
+      // Throttled: the status line is already on the window, and a node's
+      // stdout usually ends up in a launch log nobody is watching live.
+      if (++reports % 20 == 0)
+        RCLCPP_INFO(node->get_logger(), "%s", label.c_str());
+
+      win_start = now;
+      win_frames = frames;
+      win_infers = infers;
+      win_us = us;
     }
 
-    // GTK owns this thread from here: frames arrive on the camera thread and are
-    // staged by gui.show(), while the GTK loop repaints and services the
-    // window. A low-frequency timer closes the window when rclcpp goes down
-    // (Ctrl-C, or `ros2 lifecycle`-style external shutdown), since a signal
-    // handler cannot safely call into GLib itself.
-    g_timeout_add(100, +[](gpointer d) -> gboolean {
+    // The GUI draws every source's hands over this frame, ours included.
+    gui.show_frame(disp);
+  };
+
+  err = cam.start(on_frame);
+  if (err != EOK) {
+    RCLCPP_ERROR(node->get_logger(), "camera start failed: %s", strerror(err));
+    g_run = false;
+    g_in_cv.notify_all();
+    worker.join();
+    rclcpp::shutdown();
+    executor.join();
+    return 1;
+  }
+
+  // GTK owns this thread from here: frames arrive on the camera thread and are
+  // staged by gui.show(), while the GTK loop repaints and services the
+  // window. A low-frequency timer closes the window when rclcpp goes down
+  // (Ctrl-C, or `ros2 lifecycle`-style external shutdown), since a signal
+  // handler cannot safely call into GLib itself.
+  g_timeout_add(
+      100,
+      +[](gpointer d) -> gboolean {
         if (!g_run.load() || !rclcpp::ok()) {
-            static_cast<HandtrackGui *>(d)->quit();
-            return G_SOURCE_REMOVE;
+          static_cast<HandtrackGui*>(d)->quit();
+          return G_SOURCE_REMOVE;
         }
         return G_SOURCE_CONTINUE;
-    }, &gui);
+      },
+      &gui);
 
-    gui.run();
+  gui.run();
 
-    // Closing the window shuts the node down too, so either exit path converges
-    // here: stop feeding the worker, then let the executor fall out of spin().
-    g_run = false;
-    cam.stop();             // no more callbacks after this returns
-    g_in_cv.notify_all();   // g_run is already false; wake the worker to exit.
-    worker.join();
-    rclcpp::shutdown();     // returns immediately if Ctrl-C already did it
-    executor.join();
-    return 0;
+  // Closing the window shuts the node down too, so either exit path converges
+  // here: stop feeding the worker, then let the executor fall out of spin().
+  g_run = false;
+  cam.stop();            // no more callbacks after this returns
+  g_in_cv.notify_all();  // g_run is already false; wake the worker to exit.
+  worker.join();
+  rclcpp::shutdown();  // returns immediately if Ctrl-C already did it
+  executor.join();
+  return 0;
 }

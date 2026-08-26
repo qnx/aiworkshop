@@ -6,10 +6,11 @@
 # stops publishing rather than leaving its last hand frozen on screen.
 std_msgs/Header header
 
-string label                # friendly name drawn on the overlay
+int32 source_id # Unique generated number at launch.
+string label  # friendly name drawn on the overlay
 
 # How this sender would like its hands drawn. a == 0 means "no preference, pick
 # one for me", which is what receivers fall back to their own palette for.
-std_msgs/ColorRGBA color
+std_msgs/ColorRGBA colour
 
 Hand[] hands

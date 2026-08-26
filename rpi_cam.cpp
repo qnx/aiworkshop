@@ -57,20 +57,26 @@ int RpiCam::init() {
     camera_set_vf_property(handle_, CAMERA_IMGPROP_FORMAT, chosen);
     camera_set_vf_property(handle_, CAMERA_IMGPROP_CREATEWINDOW, 0);
 
-    // Pick the smallest viewfinder resolution the camera offers. Every stage
+    // Pick the smallest viewfinder resolution at or above 720p. Every stage
     // downstream is per-pixel -- the NV12->BGR conversion, the window blit, and
     // the letterbox/crop feeding two 192/224-input models -- so capturing at
-    // sensor resolution only to throw pixels away is pure cost. Anything at or
-    // above ~256px still oversamples the model inputs.
+    // sensor resolution only to throw pixels away is pure cost. The 720p floor
+    // is for the operator, not the models: below it the window is too small to
+    // read the overlay, and the models still oversample at 1280x720.
+    constexpr long MIN_PIXELS = 1280 * 720;
     camera_res_t resolutions[32];
     uint32_t res_num = 0;
     if (camera_get_supported_vf_resolutions(handle_, 32, &res_num, resolutions) == EOK && res_num > 0) {
+        auto px = [](const camera_res_t &r) {
+            return static_cast<long>(r.width) * r.height;
+        };
         uint32_t best = 0;
         for (uint32_t i = 1; i < res_num; i++) {
-            if (resolutions[i].width * resolutions[i].height <
-                resolutions[best].width * resolutions[best].height) {
-                best = i;
-            }
+            const long a = px(resolutions[i]), b = px(resolutions[best]);
+            const bool a_ok = a >= MIN_PIXELS, b_ok = b >= MIN_PIXELS;
+            // Prefer 720p or better; among those the smallest. If nothing on
+            // offer reaches 720p, take the largest rather than the smallest.
+            if (a_ok != b_ok ? a_ok : (a_ok ? a < b : a > b)) best = i;
         }
         int rw = static_cast<int>(resolutions[best].width);
         int rh = static_cast<int>(resolutions[best].height);

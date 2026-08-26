@@ -8,7 +8,7 @@ if [ -f "/opt/ros/jazzy/local_setup.bash" ]; then
     ROS2_HOST_INSTALLATION_PATH=/opt/ros/jazzy
     echo "Found ROS2 Installation in $ROS2_HOST_INSTALLATION_PATH"
 else
-    echo "Failed to find ROS2 in expected locations, please run 'sudo apk add ros2-jazzy'"
+    echo "Failed to find ROS2 in expected locations, please run ./configure.sh"
     exit 1
 fi
 

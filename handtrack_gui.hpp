@@ -14,143 +14,160 @@
  * limitations under the License.
  */
 
- /**
-  * @file handtrack_gui.hpp
-  * 
-  * GTK4 GUI for sensor framework camera with handtrack overlay.
-  * 
-  */
+/**
+ * @file handtrack_gui.hpp
+ *
+ * GTK4 GUI for sensor framework camera with handtrack overlay.
+ *
+ * Two overlays, drawn from two different sources:
+ *   - our own hands, from the local pipeline: full 21-point skeleton and box.
+ *   - "visitors", from peers on the network: one dot per hand plus their tag.
+ *     The mesh only carries a point per hand, so there is no skeleton to draw.
+ */
 #pragma once
 
-#include "handtracking.hpp"
+#include <gtk/gtk.h>
 
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <opencv2/core.hpp>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include <opencv2/core.hpp>
-#include <gtk/gtk.h>
+#include "handtracking.hpp"
 
 /**
- * @brief Who a set of hands came from, and how they want to be drawn.
- *
- * Deliberately free of any ROS type: the GUI does not care whether a source is
- * this machine's own camera or a peer decoded off a topic.
+ * Choose your Colour and and label which appears in the gui
  */
-struct HandSource {
-    std::string id;      ///< Unique ID. generated on launch
-    std::string label;   ///< Drawn on the overlay; falls back to id when empty.
-    bool local = false;  ///< If this is generated locally or over the network.
-    cv::Scalar color{-1, -1, -1}; ///< Preferred colour, in BGR.
+inline constexpr const char* MY_LABEL = "NAME";
+inline const cv::Scalar MY_COLOUR{255, 0, 0};  // BGR
+
+/// One peer's hands as they arrive off the network.
+struct HandVisitor {
+  int32_t id = 0;
+  std::string label;
+  cv::Scalar colour{-1, -1, -1};  // negative == no preference, pick for them
+
+  struct Info {
+    cv::Point2f pt;  // window coordinates
+    float score = 0.f;
+    float handedness = 0.5f;
+  };
+  std::vector<Info> pts;
 };
 
 class HandtrackGui {
-   public:
-    /// A sink for landmarks. Anything that produces hands -- the local worker, a
-    /// subscription carrying a peer's hands -- can hold one of these and stay
-    /// ignorant of the GUI.
-    using HandsCallback =
-        std::function<void(const HandSource &source, const std::vector<Hand> &hands)>;
+ public:
+  /// A sink for our own landmarks, so the inference worker can stay ignorant of
+  /// the GUI.
+  using HandsCallback = std::function<void(const std::vector<Hand>&)>;
 
-    HandtrackGui() = default;
-    ~HandtrackGui();
+  HandtrackGui() = default;
+  ~HandtrackGui();
 
-    HandtrackGui(const HandtrackGui &) = delete;
-    HandtrackGui &operator=(const HandtrackGui &) = delete;
+  HandtrackGui(const HandtrackGui&) = delete;
+  HandtrackGui& operator=(const HandtrackGui&) = delete;
 
-    /**
-     * @brief Create the window and drawing area at the given size.
-     *
-     * Must be called on the main thread, before run().
-     *
-     * @return 0 on success, negative on failure.
-     */
-    int open(int width, int height, const char *title = "handtrack");
+  /**
+   * @brief Create the window and drawing area at the given size.
+   *
+   * Must be called on the main thread, before run().
+   *
+   * @return 0 on success, negative on failure.
+   */
+  int open(int width, int height, const char* title = "handtrack");
 
-    /// Gets the drawing size in <width, height> format
-    std::pair<int, int> get_size() const { return std::make_pair(width_, height_); }
+  /// Gets the drawing size in <width, height> format
+  std::pair<int, int> get_size() const {
+    return std::make_pair(width_, height_);
+  }
 
-    int width() const { return width_; }
-    int height() const { return height_; }
+  int width() const { return width_; }
+  int height() const { return height_; }
 
-    /**
-     * @brief Draw a camera frame plus every source's hands, and stage it.
-     *
-     * Takes BGR at any size (rescaled to the window if it does not match, though
-     * landmarks are assumed to be in window coordinates). Composites on the
-     * calling thread -- call it from one thread only, normally the capture
-     * callback.
-     */
-    void show_frame(const cv::Mat &bgr);
+  /**
+   * @brief Stage a camera frame for display.
+   *
+   * Takes BGR at any size, rescaled to the window if it does not match. The
+   * overlays are drawn over it on the GTK thread, so this is video only. Call
+   * it from one thread only, normally the capture callback.
+   */
+  void show_frame(const cv::Mat& bgr);
 
-    /**
-     * @brief Replace one source's hands with its newest set. Safe from any thread.
-     *
-     * An empty vector means "this source sees no hands", which is different from
-     * a source going silent: a source that stops calling is dropped from the
-     * display after a couple of seconds rather than leaving a hand frozen on
-     * screen forever.
-     *
-     * Landmarks must already be in window coordinates -- a caller relaying a
-     * peer's hands is responsible for scaling them.
-     */
-    void update_hands(const HandSource &source, const std::vector<Hand> &hands);
+  /// Replace our own hands with the newest set. Safe from any thread.
+  void update_hands(const std::vector<Hand>& hands);
 
-    /// update_hands() as a callable, for handing to a producer.
-    HandsCallback hands_callback();
+  /**
+   * @brief Replace one peer's visitor with its newest set. Safe from any
+   * thread.
+   *
+   * An empty pts means "this peer sees no hands", which is different from a
+   * peer going silent: a peer that stops publishing is dropped from the display
+   * after a couple of seconds rather than leaving a dot frozen on screen.
+   *
+   * Points must already be in window coordinates -- the caller decoding the
+   * message is responsible for scaling them.
+   */
+  void update_visitor(const HandVisitor& visitor);
 
-    /**
-     * @brief Set the status line drawn over the frame. Safe from any thread.
-     *
-     * Drawn in widget coordinates rather than baked into the frame, so it stays
-     * legible at any window size and shrinks to fit rather than being clipped.
-     */
-    void set_status(const std::string &text);
+  /// update_hands() as a callable, for handing to a producer.
+  HandsCallback hands_callback();
 
-    /// Run the GTK main loop. Blocks until the window closes or quit() is called.
-    void run();
+  /**
+   * @brief Set the status line drawn over the frame. Safe from any thread.
+   *
+   * Drawn in widget coordinates rather than baked into the frame, so it stays
+   * legible at any window size and shrinks to fit rather than being clipped.
+   */
+  void set_status(const std::string& text);
 
-    /// Ask the main loop to exit. Safe to call from any thread.
-    void quit();
+  /// Run the GTK main loop. Blocks until the window closes or quit() is called.
+  void run();
 
-    /// Toggle fullscreen. Bound to `f` / F11; main-thread only.
-    void toggle_fullscreen();
+  /// Ask the main loop to exit. Safe to call from any thread.
+  void quit();
 
-   private:
-    struct SourceHands {
-        HandSource source;
-        std::vector<Hand> hands;
-        std::chrono::steady_clock::time_point seen;
-    };
+  /// Toggle fullscreen. Bound to `f` / F11; main-thread only.
+  void toggle_fullscreen();
 
-    static void on_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer data);
-    static gboolean on_tick(gpointer data);
+ private:
+  struct Visitor {
+    HandVisitor visitor;
+    std::chrono::steady_clock::time_point seen;
+  };
 
-    /// Draw every live source's hands onto a BGR image, in place.
-    void draw_hands(cv::Mat &bgr);
+  static void on_draw(GtkDrawingArea* area, cairo_t* cr, int w, int h,
+                      gpointer data);
+  static gboolean on_tick(gpointer data);
 
-    GtkWidget *window_ = nullptr;
-    GtkWidget *area_ = nullptr;
-    GMainLoop *loop_ = nullptr;
-    guint tick_id_ = 0;
+  /// Draw both overlays -- our hands, and the visitors -- over the staged
+  /// frame, in widget pixels, on the GTK thread.
+  void draw_overlay(cairo_t* cr, int w, int h);
 
-    std::mutex mtx_;
-    std::vector<uint8_t> frame_;   // staged BGRX, width_*height_*4
-    bool have_frame_ = false;
-    std::string status_;
+  GtkWidget* window_ = nullptr;
+  GtkWidget* area_ = nullptr;
+  GMainLoop* loop_ = nullptr;
+  guint tick_id_ = 0;
 
-    std::mutex hands_mtx_;
-    std::map<std::string, SourceHands> sources_;
+  std::mutex mtx_;
+  std::vector<uint8_t> frame_;  // staged BGRX, width_*height_*4
+  bool have_frame_ = false;
+  std::string status_;
 
-    // Scratch for show_frame(), reused per frame. Capture thread only.
-    cv::Mat canvas_, bgrx_;
+  std::mutex hands_mtx_;
+  std::vector<Hand> hands_;
 
-    int width_ = 0;
-    int height_ = 0;
-    bool fullscreen_ = false;
+  std::mutex visitors_mtx_;
+  std::map<int32_t, Visitor> visitors_;
+
+  // Scratch for show_frame(), reused per frame. Capture thread only.
+  cv::Mat canvas_, bgrx_;
+
+  int width_ = 0;
+  int height_ = 0;
+  bool fullscreen_ = false;
 };
